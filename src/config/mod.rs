@@ -205,7 +205,7 @@ impl Default for Config {
             agent: None,
             model: Default::default(),
             functions: Default::default(),
-            working_mode: WorkingMode::Command,
+            working_mode: WorkingMode::Cmd,
             last_message: None,
         }
     }
@@ -839,10 +839,14 @@ impl Config {
 
     pub fn role_info(&self) -> Result<String> {
         if let Some(role) = &self.role {
-            Ok(role.export())
-        } else {
-            bail!("No role")
+            return Ok(role.export());
+        } else if let Some(session) = &self.session {
+            let role = session.to_role();
+            if !role.name().is_empty() {
+                return Ok(role.export());
+            }
         }
+        bail!("No role");
     }
 
     pub fn exit_role(&mut self) -> Result<()> {
@@ -1089,8 +1093,8 @@ impl Config {
     pub fn clear_session_messages(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.clear_messages();
-            if let Some(prompt) = self.agent.as_ref().map(|v| v.interpolated_instructions()) {
-                session.update_role_prompt(&prompt);
+            if let Some(agent) = self.agent.as_ref() {
+                session.set_agent(agent);
             }
         } else {
             bail!("No session")
@@ -1195,6 +1199,9 @@ impl Config {
             Some(name) => {
                 let rag_path = config.read().rag_file(name)?;
                 if !rag_path.exists() {
+                    if config.read().working_mode.is_cmd() {
+                        bail!("Unknown RAG '{name}'")
+                    }
                     Rag::init(config, name, &rag_path, &[], abort_signal).await?
                 } else {
                     Rag::load(config, name, &rag_path)?
@@ -1372,7 +1379,7 @@ impl Config {
 
     pub fn apply_prelude(&mut self) -> Result<()> {
         let prelude = match self.working_mode {
-            WorkingMode::Command => self.prelude.as_ref(),
+            WorkingMode::Cmd => self.prelude.as_ref(),
             WorkingMode::Repl => self.repl_prelude.as_ref().or(self.prelude.as_ref()),
             WorkingMode::Serve => return Ok(()),
         };
@@ -1396,6 +1403,14 @@ impl Config {
             Some(("session", name)) => {
                 if self.session.is_none() {
                     self.use_session(Some(name)).with_context(err_msg)?;
+                }
+            }
+            Some((session_name, role_name)) => {
+                if self.session.is_none() {
+                    self.use_session(Some(session_name)).with_context(err_msg)?;
+                    if let Some(true) = self.session.as_ref().map(|v| v.is_empty()) {
+                        self.use_role(role_name).with_context(err_msg)?;
+                    }
                 }
             }
             _ => {
@@ -1957,10 +1972,8 @@ impl Config {
         if let Some(Some(v)) = read_env_bool("highlight") {
             self.highlight = v;
         }
-        if let Ok(value) = env::var("NO_COLOR") {
-            if let Some(false) = parse_bool(&value) {
-                self.highlight = false;
-            }
+        if *NO_COLOR {
+            self.highlight = false;
         }
         if let Some(Some(v)) = read_env_bool("light_theme") {
             self.light_theme = v;
@@ -2033,12 +2046,15 @@ pub fn load_env_file() -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkingMode {
-    Command,
+    Cmd,
     Repl,
     Serve,
 }
 
 impl WorkingMode {
+    pub fn is_cmd(&self) -> bool {
+        *self == WorkingMode::Cmd
+    }
     pub fn is_repl(&self) -> bool {
         *self == WorkingMode::Repl
     }
@@ -2152,14 +2168,6 @@ where
 fn read_env_bool(key: &str) -> Option<Option<bool>> {
     let value = env::var(get_env_name(key)).ok()?;
     Some(parse_bool(&value))
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value {
-        "1" | "true" => Some(true),
-        "0" | "false" => Some(false),
-        _ => None,
-    }
 }
 
 fn complete_bool(value: bool) -> Vec<String> {
